@@ -1,0 +1,24 @@
+# Daml build output and local demo state
+.daml/
+**/.daml/
+*.sqlite
+*.sqlite3
+
+# Python runtime output
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.jks
+
+# Editor and operating-system metadata
+.DS_Store
+.idea/
+.vscode/

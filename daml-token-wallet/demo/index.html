@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"
+    >
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#07141b">
+    <title>D1 Judge Console | Spend-limited AI wallet</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to the judge console</a>
+
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="#main-content" aria-label="D1 judge console home">
+          <span class="brand-mark" aria-hidden="true">D1</span>
+          <span>
+            <span class="brand-title">Agent Wallet Control</span>
+            <span class="brand-subtitle">Spend authority you can inspect</span>
+          </span>
+        </a>
+        <div class="environment-cluster" aria-label="Environment status">
+          <span class="environment-badge">LocalNet · not production</span>
+          <span id="health-badge" class="health-badge health-checking">API checking</span>
+        </div>
+      </div>
+    </header>
+
+    <main id="main-content" class="page-shell" tabindex="-1">
+      <section class="hero" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Cantor8 · Daml challenge D1</p>
+          <h1 id="page-title">A wallet the agent can use, but cannot overrule.</h1>
+          <p class="hero-copy">
+            Submit a real LocalNet Amulet charge, challenge the on-ledger policy,
+            and inspect the resulting evidence without giving this console owner authority.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="refresh-button" class="button button-secondary" type="button">
+            Refresh evidence
+          </button>
+          <p id="checked-at" class="checked-at">Awaiting ledger state</p>
+        </div>
+      </section>
+
+      <div id="state-alert" class="notice notice-error" role="alert" hidden></div>
+      <div id="status-live" class="sr-only" aria-live="polite"></div>
+
+      <section class="dashboard-grid" aria-label="Wallet status">
+        <article class="panel mandate-panel" aria-labelledby="mandate-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">On-ledger authority</p>
+              <h2 id="mandate-title">Mandate</h2>
+            </div>
+            <span id="mandate-status" class="status-pill status-neutral">Unavailable</span>
+          </div>
+
+          <label class="field-label" for="mandate-select">Mandate to inspect</label>
+          <select id="mandate-select" class="control" disabled>
+            <option value="">No mandates loaded</option>
+          </select>
+
+          <dl class="metric-grid" aria-label="Mandate balance">
+            <div class="metric metric-primary">
+              <dt>Remaining</dt>
+              <dd id="mandate-remaining">—</dd>
+            </div>
+            <div class="metric">
+              <dt>Lifetime cap</dt>
+              <dd id="mandate-cap">—</dd>
+            </div>
+            <div class="metric">
+              <dt>Spent</dt>
+              <dd id="mandate-spent">—</dd>
+            </div>
+          </dl>
+
+          <progress id="mandate-progress" class="mandate-progress" value="0" max="1">
+            Spend information unavailable
+          </progress>
+
+          <dl class="detail-list">
+            <div>
+              <dt>Mandate ID</dt>
+              <dd id="mandate-id" class="mono wrap-anywhere">—</dd>
+            </div>
+            <div>
+              <dt>Strict ledger expiry</dt>
+              <dd id="mandate-expiry">—</dd>
+            </div>
+            <div>
+              <dt>Stable control contract</dt>
+              <dd id="mandate-control" class="mono wrap-anywhere">—</dd>
+            </div>
+          </dl>
+
+          <div class="allow-list-block">
+            <h3>Exact Party allow-list</h3>
+            <ul id="allow-list" class="token-list">
+              <li class="empty-state">No allowed counterparties loaded</li>
+            </ul>
+          </div>
+        </article>
+
+        <article class="panel identity-panel" aria-labelledby="identity-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">Submitting identity</p>
+              <h2 id="identity-title">Least-privilege agent</h2>
+            </div>
+            <span class="constraint-badge">No owner key</span>
+          </div>
+
+          <dl class="detail-list identity-details">
+            <div>
+              <dt>Ledger user</dt>
+              <dd id="identity-user" class="mono wrap-anywhere">—</dd>
+            </div>
+            <div>
+              <dt>Agent Party</dt>
+              <dd id="identity-agent" class="mono wrap-anywhere">—</dd>
+            </div>
+            <div>
+              <dt>Owner Party</dt>
+              <dd id="identity-owner" class="mono wrap-anywhere">—</dd>
+            </div>
+          </dl>
+
+          <div class="rights-block">
+            <h3>Exact participant rights</h3>
+            <ul id="identity-rights" class="rights-list">
+              <li class="empty-state">No rights loaded</li>
+            </ul>
+          </div>
+
+          <p class="panel-note">
+            This browser submits through the restricted agent service. It exposes no owner mutation endpoint.
+          </p>
+        </article>
+      </section>
+
+      <section class="action-layout" aria-label="Judge controls">
+        <article class="panel charge-panel" aria-labelledby="charge-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">Live policy challenge</p>
+              <h2 id="charge-title">Ask the agent to pay</h2>
+            </div>
+            <span id="submitter-badge" class="identity-badge">Identity unavailable</span>
+          </div>
+
+          <p class="section-intro">
+            Try a permitted amount first. Then exceed the remaining cap or paste a different
+            Party to see Daml reject the same agent identity.
+          </p>
+
+          <div id="challenge-guidance" class="notice notice-warning challenge-guidance" role="status" hidden>
+            Post-revocation challenge: the same restricted agent will submit a formerly valid
+            payment. The consumed stable control should make the ledger reject it. This console
+            still has no owner authority or owner mutation route.
+          </div>
+
+          <form id="charge-form" novalidate>
+            <div class="form-grid">
+              <div class="field-group">
+                <label class="field-label" for="amount-input">Amount in Amulet</label>
+                <input
+                  id="amount-input"
+                  class="control"
+                  name="amount"
+                  type="text"
+                  inputmode="decimal"
+                  autocomplete="off"
+                  placeholder="0.25"
+                  required
+                  aria-describedby="amount-help"
+                >
+                <p id="amount-help" class="field-help">No browser-side cap: the ledger decides.</p>
+              </div>
+
+              <div class="field-group field-wide">
+                <label class="field-label" for="counterparty-input">Exact counterparty Party</label>
+                <input
+                  id="counterparty-input"
+                  class="control mono"
+                  name="counterparty"
+                  type="text"
+                  list="counterparty-options"
+                  autocomplete="off"
+                  placeholder="corridor-clear-1::…"
+                  required
+                  aria-describedby="counterparty-help"
+                >
+                <datalist id="counterparty-options"></datalist>
+                <p id="counterparty-help" class="field-help">
+                  Editable so you can deliberately test a forbidden Party.
+                </p>
+              </div>
+
+              <div class="field-group field-full">
+                <label class="field-label" for="memo-input">Human-audit memo</label>
+                <textarea
+                  id="memo-input"
+                  class="control"
+                  name="memo"
+                  rows="3"
+                  maxlength="160"
+                  placeholder="What is the agent buying, and why? (160 characters maximum)"
+                  required
+                ></textarea>
+              </div>
+            </div>
+
+            <div id="form-error" class="notice notice-error compact-notice" role="alert" hidden></div>
+
+            <div class="submission-row">
+              <div>
+                <span class="micro-label">Request ID</span>
+                <span id="request-id" class="mono request-id">Created on submission</span>
+              </div>
+              <div class="button-row">
+                <button id="abandon-button" class="button button-quiet" type="button" hidden>
+                  Abandon uncertain retry
+                </button>
+                <button id="charge-button" class="button button-primary" type="submit" disabled>
+                  Submit charge
+                </button>
+              </div>
+            </div>
+          </form>
+        </article>
+
+        <aside class="panel owner-panel" aria-labelledby="owner-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">Separate authority</p>
+              <h2 id="owner-title">Owner controls</h2>
+            </div>
+            <span class="constraint-badge">Terminal only</span>
+          </div>
+
+          <p class="section-intro">
+            These commands are deliberately not executable by the judge console. Copy them into
+            the prepared local shell to act as the owner.
+          </p>
+
+          <div id="provision-command-block" class="command-block" hidden>
+            <div class="command-heading">
+              <h3>Provision a fresh mandate</h3>
+              <button id="copy-provision" class="copy-button" type="button">Copy</button>
+            </div>
+            <code id="provision-command" class="command-text"></code>
+          </div>
+
+          <div id="revoke-command-block" class="command-block" hidden>
+            <div class="command-heading">
+              <h3>Revoke the selected mandate</h3>
+              <button id="copy-revoke" class="copy-button" type="button">Copy</button>
+            </div>
+            <code id="revoke-command" class="command-text"></code>
+          </div>
+
+          <p id="owner-guidance" class="panel-note">
+            Load ledger state to generate the applicable owner command.
+          </p>
+          <p id="copy-status" class="copy-status" aria-live="polite"></p>
+        </aside>
+      </section>
+
+      <section id="result-panel" class="panel result-panel" aria-labelledby="result-title" hidden>
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">Submission outcome</p>
+            <h2 id="result-title" tabindex="-1">Latest result</h2>
+          </div>
+          <span id="result-status" class="status-pill status-neutral">Unknown</span>
+        </div>
+        <p id="result-message" class="result-message"></p>
+        <dl id="result-evidence" class="evidence-grid"></dl>
+      </section>
+
+      <section class="evidence-layout" aria-label="Audit and operational evidence">
+        <article class="panel audit-panel" aria-labelledby="audit-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">Durable ledger evidence</p>
+              <h2 id="audit-title">Audit timeline</h2>
+            </div>
+            <span id="audit-count" class="count-badge">0 records</span>
+          </div>
+          <ol id="audit-timeline" class="timeline">
+            <li class="empty-state">Select a mandate to inspect its audit history.</li>
+          </ol>
+        </article>
+
+        <article class="panel operations-panel" aria-labelledby="operations-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">Service observability</p>
+              <h2 id="operations-title">Operational rejection log</h2>
+            </div>
+            <span class="off-ledger-badge">Off-ledger</span>
+          </div>
+          <p class="section-intro">
+            Failed Daml transactions create no ledger contract. These correlated service records
+            are operational evidence, not on-ledger audit entries.
+          </p>
+          <ol id="operation-log" class="operation-list">
+            <li class="empty-state">No rejected or uncertain operations reported.</li>
+          </ol>
+        </article>
+      </section>
+
+      <section class="panel proof-panel" aria-labelledby="proof-title">
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">Reproducible support</p>
+            <h2 id="proof-title">Build, package and smoke evidence</h2>
+          </div>
+          <span id="scope-badge" class="scope-badge">Scope unavailable</span>
+        </div>
+        <div class="proof-grid">
+          <section aria-labelledby="tests-title">
+            <h3 id="tests-title">Tests</h3>
+            <div id="proof-tests" class="proof-list"></div>
+          </section>
+          <section aria-labelledby="packages-title">
+            <h3 id="packages-title">Packages</h3>
+            <div id="proof-packages" class="proof-list"></div>
+          </section>
+          <section aria-labelledby="smoke-title">
+            <h3 id="smoke-title">Recorded LocalNet smoke</h3>
+            <div id="proof-smoke" class="proof-list"></div>
+          </section>
+        </div>
+
+        <div class="source-section">
+          <h3>Exact Daml source excerpts</h3>
+          <p class="section-intro">
+            Expand the policy paths used by this demonstration. Source is presented as evidence;
+            this page does not edit it.
+          </p>
+          <div id="source-excerpts" class="source-excerpts"></div>
+        </div>
+      </section>
+
+      <section class="panel limitations-panel" aria-labelledby="limitations-title">
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">Evidence boundary</p>
+            <h2 id="limitations-title">What this demo does not prove</h2>
+          </div>
+        </div>
+        <ul id="limitations-list" class="limitations-list">
+          <li class="empty-state">Limitations have not yet loaded.</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>D1 judge console · loopback-only demonstration · spend authority remains on-ledger</p>
+    </footer>
+  </body>
+</html>

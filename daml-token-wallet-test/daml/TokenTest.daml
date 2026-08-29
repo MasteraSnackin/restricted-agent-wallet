@@ -1,0 +1,623 @@
+module TokenTest where
+
+import DA.Assert ((===))
+import DA.Optional (isNone)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours, minutes)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as Holding
+import Splice.Api.Token.MetadataV1 qualified as Metadata
+import Splice.Api.Token.TransferInstructionV1 qualified as TI
+
+import MockToken
+import TokenMandate
+
+
+emptyContext : Metadata.ChoiceContext
+emptyContext = Metadata.ChoiceContext with values = TextMap.empty
+
+
+tokenMeta : Text -> Text -> Metadata.Metadata
+tokenMeta mandateId memo = Metadata.Metadata with
+  values = TextMap.fromList
+    [ ("splice.lfdecentralizedtrust.org/reason", memo)
+    , ("cantor8.local/mandate-id", mandateId)
+    ]
+
+
+directTransferArg
+  : Party
+  -> Party
+  -> Party
+  -> Holding.InstrumentId
+  -> Decimal
+  -> [ContractId Holding.Holding]
+  -> Time
+  -> Time
+  -> TI.TransferFactory_Transfer
+directTransferArg expectedAdmin sender receiver instrumentId amount inputHoldingCids requestedAt executeBefore =
+  TI.TransferFactory_Transfer with
+    expectedAdmin = expectedAdmin
+    transfer = TI.Transfer with
+      sender = sender
+      receiver = receiver
+      amount = amount
+      instrumentId = instrumentId
+      requestedAt = requestedAt
+      executeBefore = executeBefore
+      inputHoldingCids = inputHoldingCids
+      meta = tokenMeta "direct-bypass" "agent bypass attempt"
+    extraArgs = Metadata.ExtraArgs with
+      context = emptyContext
+      meta = Metadata.emptyMetadata
+
+
+testTokenPolicyAndStableRevocation : Script ()
+testTokenPolicyAndStableRevocation = script do
+  admin <- allocateParty "TokenAdmin"
+  owner <- allocateParty "TokenOwner"
+  agent <- allocateParty "TokenAgent"
+  merchant <- allocateParty "ApprovedTokenMerchant"
+  merchantLookalike <- allocateParty "ApprovedTokenMerchant-lookalike"
+  outsider <- allocateParty "TokenOutsider"
+  now <- getTime
+  let expiresAt = addRelTime now (hours 24)
+  let executeBefore = addRelTime now (minutes 5)
+  let instrumentId = Holding.InstrumentId with admin = admin; id = "Amulet"
+
+  inputCid <- submit admin do
+    createCmd MockHolding with
+      admin = admin
+      owner = owner
+      readers = [agent]
+      instrumentId = instrumentId
+      amount = 100.0
+      lock = None
+  let input = toInterfaceContractId inputCid
+
+  factoryCid <- submit admin do
+    createCmd MockTransferFactory with
+      admin = admin
+      readers = [owner, agent]
+      mode = MockComplete
+  let factory = toInterfaceContractId factoryCid
+
+  proposal <- submit owner do
+    createCmd TokenMandateProposal with
+      mandateId = "token-wallet-001"
+      owner = owner
+      spender = agent
+      expectedAdmin = admin
+      instrumentId = instrumentId
+      cap = 50.0
+      allowedCounterparties = [merchant]
+      expiresAt = expiresAt
+
+  submitMustFail owner do exerciseCmd proposal Accept
+  activated <- submit agent do exerciseCmd proposal Accept
+
+  -- The stable gate is jointly signed, but Revoke remains owner-controlled.
+  -- Neither party can unilaterally use the implicit Archive choice to bypass
+  -- the audited revocation path.
+  submitMustFail owner do exerciseCmd activated.control Archive
+  submitMustFail agent do exerciseCmd activated.control Archive
+
+  submitMustFail owner do
+    createCmd TokenRevocationAudit with
+      mandateId = "owner-forged-revocation"
+      owner = owner
+      spender = agent
+      revokedAt = now
+      totalCap = 50.0
+      reason = "forged"
+  submitMustFail agent do
+    createCmd TokenRevocationAudit with
+      mandateId = "agent-forged-revocation"
+      owner = owner
+      spender = agent
+      revokedAt = now
+      totalCap = 50.0
+      reason = "forged"
+
+  Some activation <- queryContractId owner activated.audit
+  activation.allowedCounterparties === [merchant]
+  Some _ <- queryContractId agent activated.audit
+  merchantActivation <- queryContractId merchant activated.audit
+  assert (isNone merchantActivation)
+
+  -- Seeing the factory and holding is not spending authority. The token-standard
+  -- factory choice is controlled by sender=owner, so agent-only bypass fails.
+  submitMustFail agent do
+    exerciseCmd factory $ directTransferArg
+      admin owner outsider instrumentId 1.0 [input] now executeBefore
+
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = outsider
+      amount = 1.0
+      memo = "forbidden recipient"
+      factoryCid = factory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchantLookalike
+      amount = 1.0
+      memo = "lookalike recipient"
+      factoryCid = factory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 0.0
+      memo = "zero amount"
+      factoryCid = factory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = -1.0
+      memo = "negative amount"
+      factoryCid = factory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 1.0
+      memo = ""
+      factoryCid = factory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  charge1 <- submit agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 30.0
+      memo = "approved route-risk data"
+      factoryCid = factory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  Some mandate1 <- queryContractId owner charge1.nextMandate
+  mandate1.spent === 30.0
+  mandate1.cap === 50.0
+  mandate1.control === activated.control
+
+  let [receiverInterfaceCid] = charge1.receiverHoldingCids
+  let receiverCid : ContractId MockHolding =
+        fromInterfaceContractId receiverInterfaceCid
+  Some receiver <- queryContractId merchant receiverCid
+  receiver.owner === merchant
+  receiver.amount === 30.0
+
+  let [changeInterfaceCid] = charge1.transferResult.senderChangeCids
+  let changeCid : ContractId MockHolding =
+        fromInterfaceContractId changeInterfaceCid
+  Some change <- queryContractId owner changeCid
+  change.owner === owner
+  change.amount === 70.0
+  receiver.amount + change.amount === 100.0
+
+  Some audit1 <- queryContractId owner charge1.audit
+  audit1.amount === 30.0
+  audit1.spentBefore === 0.0
+  audit1.spentAfter === 30.0
+  audit1.allowedCounterparties === [merchant]
+  Some _ <- queryContractId agent charge1.audit
+  merchantAudit <- queryContractId merchant charge1.audit
+  assert (isNone merchantAudit)
+
+  submitMustFail owner do exerciseCmd charge1.audit Archive
+  submitMustFail agent do exerciseCmd charge1.audit Archive
+
+  -- A stale command cannot reset the cumulative spend.
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 1.0
+      memo = "stale mandate"
+      factoryCid = factory
+      inputHoldingCids = [changeInterfaceCid]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  submitMustFail agent do
+    exerciseCmd charge1.nextMandate ChargeToken with
+      counterparty = merchant
+      amount = 21.0
+      memo = "over cap"
+      factoryCid = factory
+      inputHoldingCids = [changeInterfaceCid]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  charge2 <- submit agent do
+    exerciseCmd charge1.nextMandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "second approved purchase"
+      factoryCid = factory
+      inputHoldingCids = [changeInterfaceCid]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  Some mandate2 <- queryContractId owner charge2.nextMandate
+  mandate2.spent === 40.0
+  mandate2.control === activated.control
+
+  -- Revocation targets the stable gate, not a rotating mandate CID. Advancing
+  -- through two charges cannot stale or replace the owner's revocation target.
+  submitMustFail agent do
+    exerciseCmd activated.control Revoke with reason = "agent attack"
+  revocation <- submit owner do
+    exerciseCmd activated.control Revoke with reason = "budget withdrawn"
+  Some row <- queryContractId owner revocation
+  row.reason === "budget withdrawn"
+  Some _ <- queryContractId agent revocation
+  submitMustFail owner do exerciseCmd revocation Archive
+  submitMustFail agent do exerciseCmd revocation Archive
+
+  submitMustFail agent do
+    exerciseCmd charge2.nextMandate ChargeToken with
+      counterparty = merchant
+      amount = 1.0
+      memo = "post-revocation"
+      factoryCid = factory
+      inputHoldingCids = charge2.transferResult.senderChangeCids
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  audits <- query @TokenChargeAudit owner
+  length audits === 2
+  pure ()
+
+
+testTokenRollbackAndGuards : Script ()
+testTokenRollbackAndGuards = script do
+  admin <- allocateParty "GuardTokenAdmin"
+  wrongAdmin <- allocateParty "WrongTokenAdmin"
+  owner <- allocateParty "GuardTokenOwner"
+  otherOwner <- allocateParty "OtherTokenOwner"
+  agent <- allocateParty "GuardTokenAgent"
+  merchant <- allocateParty "GuardTokenMerchant"
+  now <- getTime
+  let expiresAt = addRelTime now (hours 24)
+  let executeBefore = addRelTime now (minutes 5)
+  let instrumentId = Holding.InstrumentId with admin = admin; id = "Amulet"
+  let wrongInstrument = Holding.InstrumentId with admin = admin; id = "Other"
+
+  inputCid <- submit admin do
+    createCmd MockHolding with
+      admin = admin
+      owner = owner
+      readers = [agent]
+      instrumentId = instrumentId
+      amount = 50.0
+      lock = None
+  let input = toInterfaceContractId inputCid
+
+  failedFactoryCid <- submit admin do
+    createCmd MockTransferFactory with
+      admin = admin
+      readers = [owner, agent]
+      mode = MockFail
+  let failedFactory = toInterfaceContractId failedFactoryCid
+
+  pendingFactoryCid <- submit admin do
+    createCmd MockTransferFactory with
+      admin = admin
+      readers = [owner, agent]
+      mode = MockPending
+  let pendingFactory = toInterfaceContractId pendingFactoryCid
+
+  completeFactoryCid <- submit admin do
+    createCmd MockTransferFactory with
+      admin = admin
+      readers = [owner, agent]
+      mode = MockComplete
+  let completeFactory = toInterfaceContractId completeFactoryCid
+
+  wrongFactoryCid <- submit wrongAdmin do
+    createCmd MockTransferFactory with
+      admin = wrongAdmin
+      readers = [owner, agent]
+      mode = MockComplete
+  let wrongFactory = toInterfaceContractId wrongFactoryCid
+
+  proposal <- submit owner do
+    createCmd TokenMandateProposal with
+      mandateId = "guard-token-wallet-001"
+      owner = owner
+      spender = agent
+      expectedAdmin = admin
+      instrumentId = instrumentId
+      cap = 40.0
+      allowedCounterparties = [merchant]
+      expiresAt = expiresAt
+  activated <- submit agent do exerciseCmd proposal Accept
+
+  -- A Failed factory result aborts the complete wrapper transaction. No input,
+  -- mandate or audit consequence can partially commit.
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "factory failure"
+      factoryCid = failedFactory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+  Some _ <- queryContractId owner inputCid
+  Some unchanged <- queryContractId owner activated.mandate
+  unchanged.spent === 0.0
+  noAudits <- query @TokenChargeAudit owner
+  assert (null noAudits)
+
+  -- A Pending result is also unacceptable: the instruction creation and every
+  -- mandate/audit consequence roll back with the wrapper transaction.
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "pending transfer"
+      factoryCid = pendingFactory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+  Some _ <- queryContractId owner inputCid
+  Some stillUnchanged <- queryContractId owner activated.mandate
+  stillUnchanged.spent === 0.0
+  pendingInstructions <- query @MockTransferInstruction admin
+  assert (null pendingInstructions)
+
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "wrong factory admin"
+      factoryCid = wrongFactory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  wrongOwnerCid <- submit admin do
+    createCmd MockHolding with
+      admin = admin
+      owner = otherOwner
+      readers = [agent]
+      instrumentId = instrumentId
+      amount = 25.0
+      lock = None
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "wrong input owner"
+      factoryCid = completeFactory
+      inputHoldingCids = [toInterfaceContractId wrongOwnerCid]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  wrongInstrumentCid <- submit admin do
+    createCmd MockHolding with
+      admin = admin
+      owner = owner
+      readers = [agent]
+      instrumentId = wrongInstrument
+      amount = 50.0
+      lock = None
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "wrong input instrument"
+      factoryCid = completeFactory
+      inputHoldingCids = [toInterfaceContractId wrongInstrumentCid]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  let lock = Holding.Lock with
+        holders = [owner]
+        expiresAt = None
+        expiresAfter = None
+        context = Some "test lock"
+  lockedCid <- submit admin do
+    createCmd MockHolding with
+      admin = admin
+      owner = owner
+      readers = [agent]
+      instrumentId = instrumentId
+      amount = 50.0
+      lock = Some lock
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "locked input"
+      factoryCid = completeFactory
+      inputHoldingCids = [toInterfaceContractId lockedCid]
+      requestedAt = now
+      executeBefore = executeBefore
+      choiceContext = emptyContext
+
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "deadline after mandate"
+      factoryCid = completeFactory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = addRelTime expiresAt (minutes 1)
+      choiceContext = emptyContext
+
+  passTime (minutes 6)
+  now2 <- getTime
+  submitMustFail agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 10.0
+      memo = "stale request"
+      factoryCid = completeFactory
+      inputHoldingCids = [input]
+      requestedAt = now
+      executeBefore = addRelTime now2 (minutes 1)
+      choiceContext = emptyContext
+
+  -- Neither party can manufacture the jointly signed mandate or audit alone.
+  submitMustFail owner do
+    createCmd TokenMandate with
+      mandateId = "owner-forged-mandate"
+      owner = owner
+      spender = agent
+      expectedAdmin = admin
+      instrumentId = instrumentId
+      cap = 40.0
+      spent = 0.0
+      allowedCounterparties = [merchant]
+      expiresAt = expiresAt
+      control = activated.control
+  submitMustFail agent do
+    createCmd TokenChargeAudit with
+      mandateId = "agent-forged-audit"
+      owner = owner
+      spender = agent
+      counterparty = merchant
+      expectedAdmin = admin
+      instrumentId = instrumentId
+      amount = 1.0
+      memo = "forged"
+      chargedAt = now2
+      totalCap = 40.0
+      spentBefore = 0.0
+      spentAfter = 1.0
+      allowedCounterparties = [merchant]
+      expiresAt = expiresAt
+      receiverHoldingCids = [input]
+  pure ()
+
+
+testTokenExactCapAndExpiry : Script ()
+testTokenExactCapAndExpiry = script do
+  admin <- allocateParty "ExactTokenAdmin"
+  owner <- allocateParty "ExactTokenOwner"
+  agent <- allocateParty "ExactTokenAgent"
+  merchant <- allocateParty "ExactTokenMerchant"
+  now <- getTime
+  let expiresAt = addRelTime now (hours 1)
+  let instrumentId = Holding.InstrumentId with admin = admin; id = "Amulet"
+
+  inputCid <- submit admin do
+    createCmd MockHolding with
+      admin = admin
+      owner = owner
+      readers = [agent]
+      instrumentId = instrumentId
+      amount = 25.0
+      lock = None
+  factoryCid <- submit admin do
+    createCmd MockTransferFactory with
+      admin = admin
+      readers = [owner, agent]
+      mode = MockComplete
+  proposal <- submit owner do
+    createCmd TokenMandateProposal with
+      mandateId = "exact-token-wallet-001"
+      owner = owner
+      spender = agent
+      expectedAdmin = admin
+      instrumentId = instrumentId
+      cap = 25.0
+      allowedCounterparties = [merchant]
+      expiresAt = expiresAt
+  activated <- submit agent do exerciseCmd proposal Accept
+
+  -- This second proposal remains unaccepted until the exact deadline. Its
+  -- rejection then has only one possible policy cause: strict expiry.
+  expiryOnlyProposal <- submit owner do
+    createCmd TokenMandateProposal with
+      mandateId = "expiry-only-token-wallet-001"
+      owner = owner
+      spender = agent
+      expectedAdmin = admin
+      instrumentId = instrumentId
+      cap = 50.0
+      allowedCounterparties = [merchant]
+      expiresAt = expiresAt
+
+  expiryInputCid <- submit admin do
+    createCmd MockHolding with
+      admin = admin
+      owner = owner
+      readers = [agent]
+      instrumentId = instrumentId
+      amount = 50.0
+      lock = None
+  expiryChargeProposal <- submit owner do
+    createCmd TokenMandateProposal with
+      mandateId = "expiry-charge-token-wallet-001"
+      owner = owner
+      spender = agent
+      expectedAdmin = admin
+      instrumentId = instrumentId
+      cap = 50.0
+      allowedCounterparties = [merchant]
+      expiresAt = expiresAt
+  expiryActivated <- submit agent do exerciseCmd expiryChargeProposal Accept
+
+  result <- submit agent do
+    exerciseCmd activated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 25.0
+      memo = "exact cap"
+      factoryCid = toInterfaceContractId factoryCid
+      inputHoldingCids = [toInterfaceContractId inputCid]
+      requestedAt = now
+      executeBefore = addRelTime now (minutes 5)
+      choiceContext = emptyContext
+  assert (null result.transferResult.senderChangeCids)
+  Some next <- queryContractId owner result.nextMandate
+  next.spent === 25.0
+
+  passTime (hours 1)
+  submitMustFail agent do exerciseCmd expiryOnlyProposal Accept
+  submitMustFail agent do
+    exerciseCmd expiryActivated.mandate ChargeToken with
+      counterparty = merchant
+      amount = 1.0
+      memo = "exact expiry"
+      factoryCid = toInterfaceContractId factoryCid
+      inputHoldingCids = [toInterfaceContractId expiryInputCid]
+      requestedAt = expiresAt
+      executeBefore = addRelTime expiresAt (minutes 1)
+      choiceContext = emptyContext
+  pure ()

@@ -1,0 +1,394 @@
+-- Daml challenge D1: a spend-limited AI-agent wallet that drives the stable
+-- Canton Token Standard V1 TransferFactory interface atomically.
+module TokenMandate where
+
+import DA.Foldable (sum)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, minutes)
+import DA.Traversable (forA)
+import Prelude hiding (forA, sum)
+
+import Splice.Api.Token.HoldingV1 qualified as Holding
+import Splice.Api.Token.MetadataV1 qualified as Metadata
+import Splice.Api.Token.TransferInstructionV1 qualified as TI
+
+
+data TokenActivationResult = TokenActivationResult
+  with
+    control : ContractId TokenMandateControl
+    mandate : ContractId TokenMandate
+    audit : ContractId TokenActivationAudit
+  deriving (Eq, Show)
+
+
+data TokenChargeResult = TokenChargeResult
+  with
+    nextMandate : ContractId TokenMandate
+    transferResult : TI.TransferInstructionResult
+    receiverHoldingCids : [ContractId Holding.Holding]
+    audit : ContractId TokenChargeAudit
+  deriving (Eq, Show)
+
+
+-- Joint evidence that the named agent accepted this exact policy.
+template TokenActivationAudit
+  with
+    mandateId : Text
+    owner : Party
+    spender : Party
+    expectedAdmin : Party
+    instrumentId : Holding.InstrumentId
+    totalCap : Decimal
+    allowedCounterparties : [Party]
+    activatedAt : Time
+    expiresAt : Time
+    control : ContractId TokenMandateControl
+  where
+    ensure
+      mandateId /= ""
+      && owner /= spender
+      && instrumentId.admin == expectedAdmin
+      && instrumentId.id /= ""
+      && totalCap > 0.0
+      && not (null allowedCounterparties)
+      && activatedAt < expiresAt
+
+    signatory owner, spender
+
+
+-- Joint evidence of a completed token-standard payment. Co-signing prevents
+-- either the owner or agent from creating or archiving a success row alone.
+template TokenChargeAudit
+  with
+    mandateId : Text
+    owner : Party
+    spender : Party
+    counterparty : Party
+    expectedAdmin : Party
+    instrumentId : Holding.InstrumentId
+    amount : Decimal
+    memo : Text
+    chargedAt : Time
+    totalCap : Decimal
+    spentBefore : Decimal
+    spentAfter : Decimal
+    allowedCounterparties : [Party]
+    expiresAt : Time
+    receiverHoldingCids : [ContractId Holding.Holding]
+  where
+    ensure
+      mandateId /= ""
+      && owner /= spender
+      && instrumentId.admin == expectedAdmin
+      && instrumentId.id /= ""
+      && amount > 0.0
+      && memo /= ""
+      && spentBefore >= 0.0
+      && spentAfter == spentBefore + amount
+      && spentAfter <= totalCap
+      && not (null allowedCounterparties)
+      && counterparty `elem` allowedCounterparties
+      && chargedAt < expiresAt
+      && not (null receiverHoldingCids)
+
+    signatory owner, spender
+
+
+-- Joint evidence created as a consequence of the owner-only Revoke choice.
+-- Co-signing prevents either party from fabricating or archiving the row alone.
+template TokenRevocationAudit
+  with
+    mandateId : Text
+    owner : Party
+    spender : Party
+    revokedAt : Time
+    totalCap : Decimal
+    reason : Text
+  where
+    ensure mandateId /= "" && owner /= spender && totalCap > 0.0 && reason /= ""
+
+    signatory owner, spender
+
+
+-- A stable jointly authenticated gate with an explicit owner-only Revoke
+-- choice. Every charge fetches this contract but does not consume it. The
+-- agent therefore cannot make an owner's revocation command stale by advancing
+-- to a successor mandate. Co-signing also prevents either party unilaterally
+-- using implicit Archive to bypass the explicit, audited owner-only path.
+template TokenMandateControl
+  with
+    mandateId : Text
+    owner : Party
+    spender : Party
+    expectedAdmin : Party
+    instrumentId : Holding.InstrumentId
+    totalCap : Decimal
+    allowedCounterparties : [Party]
+    expiresAt : Time
+  where
+    ensure
+      mandateId /= ""
+      && owner /= spender
+      && instrumentId.admin == expectedAdmin
+      && instrumentId.id /= ""
+      && totalCap > 0.0
+      && not (null allowedCounterparties)
+      && all (\party -> party /= owner && party /= spender) allowedCounterparties
+
+    signatory owner, spender
+
+    choice Revoke : ContractId TokenRevocationAudit
+      with reason : Text
+      controller owner
+      do
+        assertMsg "revocation reason is required" (reason /= "")
+        now <- getTime
+        create TokenRevocationAudit with
+          mandateId = mandateId
+          owner = owner
+          spender = spender
+          revokedAt = now
+          totalCap = totalCap
+          reason = reason
+
+
+template TokenMandate
+  with
+    mandateId : Text
+    owner : Party
+    spender : Party
+    expectedAdmin : Party
+    instrumentId : Holding.InstrumentId
+    cap : Decimal
+    spent : Decimal
+    allowedCounterparties : [Party]
+    expiresAt : Time
+    control : ContractId TokenMandateControl
+  where
+    ensure
+      mandateId /= ""
+      && owner /= spender
+      && instrumentId.admin == expectedAdmin
+      && instrumentId.id /= ""
+      && cap > 0.0
+      && spent >= 0.0
+      && spent <= cap
+      && not (null allowedCounterparties)
+      && all (\party -> party /= owner && party /= spender) allowedCounterparties
+
+    -- Acceptance and every successor require both parties. Revocation remains
+    -- owner-only because it lives on TokenMandateControl, not this contract.
+    signatory owner, spender
+
+    choice ChargeToken : TokenChargeResult
+      with
+        counterparty : Party
+        amount : Decimal
+        memo : Text
+        factoryCid : ContractId TI.TransferFactory
+        inputHoldingCids : [ContractId Holding.Holding]
+        requestedAt : Time
+        executeBefore : Time
+        choiceContext : Metadata.ChoiceContext
+      controller spender
+      do
+        now <- getTime
+        let nextSpent = spent + amount
+
+        -- Policy checks are on-ledger. The registry helper supplies opaque
+        -- context and disclosures but cannot choose a different policy.
+        assertMsg "mandate expired" (now < expiresAt)
+        assertMsg "amount must be positive" (amount > 0.0)
+        assertMsg "counterparty is not allowed"
+          (counterparty `elem` allowedCounterparties)
+        assertMsg "owner and agent cannot be payment counterparties"
+          (counterparty /= owner && counterparty /= spender)
+        assertMsg "charge would exceed the total cap" (nextSpent <= cap)
+        assertMsg "memo is required for the human audit trail" (memo /= "")
+        assertMsg "requestedAt is in the future" (requestedAt <= now)
+        assertMsg "request is too old"
+          (now <= addRelTime requestedAt (minutes 5))
+        assertMsg "executeBefore is not in the future" (now < executeBefore)
+        assertMsg "transfer deadline exceeds mandate expiry"
+          (executeBefore <= expiresAt)
+        assertMsg "transfer window is too long"
+          (executeBefore <= addRelTime requestedAt (minutes 10))
+        assertMsg "at least one input holding is required"
+          (not (null inputHoldingCids))
+
+        gate <- fetch control
+        assertMsg "revocation gate mandate mismatch" (gate.mandateId == mandateId)
+        assertMsg "revocation gate owner mismatch" (gate.owner == owner)
+        assertMsg "revocation gate agent mismatch" (gate.spender == spender)
+        assertMsg "revocation gate admin mismatch" (gate.expectedAdmin == expectedAdmin)
+        assertMsg "revocation gate instrument mismatch" (gate.instrumentId == instrumentId)
+        assertMsg "revocation gate cap mismatch" (gate.totalCap == cap)
+        assertMsg "revocation gate allow-list mismatch"
+          (gate.allowedCounterparties == allowedCounterparties)
+        assertMsg "revocation gate expiry mismatch" (gate.expiresAt == expiresAt)
+
+        inputAmounts <- forA inputHoldingCids $ \holdingCid -> do
+          holding <- fetch @Holding.Holding holdingCid
+          let holdingView = view @Holding.Holding holding
+          assertMsg "input holding owner mismatch" (holdingView.owner == owner)
+          assertMsg "input holding instrument mismatch"
+            (holdingView.instrumentId == instrumentId)
+          assertMsg "locked input holding is not supported" (holdingView.lock == None)
+          assertMsg "input holding amount must be positive" (holdingView.amount > 0.0)
+          pure holdingView.amount
+        assertMsg "selected holdings are below the requested amount"
+          (sum inputAmounts >= amount)
+
+        let transferMeta = Metadata.Metadata with
+              values = TextMap.fromList
+                [ ("splice.lfdecentralizedtrust.org/reason", memo)
+                , ("cantor8.local/mandate-id", mandateId)
+                ]
+
+        -- Do not pre-fetch the registry's factory: a real Amulet factory can
+        -- be private to the DSO, so a separate fetch would require a DSO
+        -- stakeholder authorizer. TransferFactory_Transfer is the public
+        -- token-standard boundary. Its vetted implementation must validate
+        -- expectedAdmin; this contract also pins every input and the
+        -- instrument to that same administrator before exercising it.
+        transferResult <- exercise factoryCid TI.TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = TI.Transfer with
+            sender = owner
+            receiver = counterparty
+            amount = amount
+            instrumentId = instrumentId
+            requestedAt = requestedAt
+            executeBefore = executeBefore
+            inputHoldingCids = inputHoldingCids
+            meta = transferMeta
+          extraArgs = Metadata.ExtraArgs with
+            context = choiceContext
+            meta = Metadata.emptyMetadata
+
+        receiverHoldingCids <- case transferResult.output of
+          TI.TransferInstructionResult_Completed completedHoldingCids ->
+            pure completedHoldingCids
+          other -> abort $
+            "direct completed transfer required; got " <> show other
+
+        assertMsg "completed transfer returned no receiver holding"
+          (not (null receiverHoldingCids))
+
+        -- The stable interface defines these as holdings created for the
+        -- receiver. They are intentionally not fetched here: on a private
+        -- ledger the owner and agent need not be stakeholders of the
+        -- merchant's new holding. The merchant-side integration test verifies
+        -- the amount from the merchant's own view.
+
+        nextMandate <- create this with spent = nextSpent
+        audit <- create TokenChargeAudit with
+          mandateId = mandateId
+          owner = owner
+          spender = spender
+          counterparty = counterparty
+          expectedAdmin = expectedAdmin
+          instrumentId = instrumentId
+          amount = amount
+          memo = memo
+          chargedAt = now
+          totalCap = cap
+          spentBefore = spent
+          spentAfter = nextSpent
+          allowedCounterparties = allowedCounterparties
+          expiresAt = expiresAt
+          receiverHoldingCids = receiverHoldingCids
+
+        pure TokenChargeResult with
+          nextMandate = nextMandate
+          transferResult = transferResult
+          receiverHoldingCids = receiverHoldingCids
+          audit = audit
+
+
+template TokenMandateProposal
+  with
+    mandateId : Text
+    owner : Party
+    spender : Party
+    expectedAdmin : Party
+    instrumentId : Holding.InstrumentId
+    cap : Decimal
+    allowedCounterparties : [Party]
+    expiresAt : Time
+  where
+    ensure
+      mandateId /= ""
+      && owner /= spender
+      && instrumentId.admin == expectedAdmin
+      && instrumentId.id /= ""
+      && cap > 0.0
+      && not (null allowedCounterparties)
+      && all (\party -> party /= owner && party /= spender) allowedCounterparties
+
+    signatory owner
+    observer spender
+
+    choice Accept : TokenActivationResult
+      controller spender
+      do
+        now <- getTime
+        assertMsg "cannot accept an expired mandate" (now < expiresAt)
+
+        controlCid <- create TokenMandateControl with
+          mandateId = mandateId
+          owner = owner
+          spender = spender
+          expectedAdmin = expectedAdmin
+          instrumentId = instrumentId
+          totalCap = cap
+          allowedCounterparties = allowedCounterparties
+          expiresAt = expiresAt
+
+        mandateCid <- create TokenMandate with
+          mandateId = mandateId
+          owner = owner
+          spender = spender
+          expectedAdmin = expectedAdmin
+          instrumentId = instrumentId
+          cap = cap
+          spent = 0.0
+          allowedCounterparties = allowedCounterparties
+          expiresAt = expiresAt
+          control = controlCid
+
+        auditCid <- create TokenActivationAudit with
+          mandateId = mandateId
+          owner = owner
+          spender = spender
+          expectedAdmin = expectedAdmin
+          instrumentId = instrumentId
+          totalCap = cap
+          allowedCounterparties = allowedCounterparties
+          activatedAt = now
+          expiresAt = expiresAt
+          control = controlCid
+
+        pure TokenActivationResult with
+          control = controlCid
+          mandate = mandateCid
+          audit = auditCid
+
+    choice Reject : ()
+      controller spender
+      do pure ()
+
+
+renderTokenChargeAudit : TokenChargeAudit -> Text
+renderTokenChargeAudit audit =
+  "mandate=" <> audit.mandateId
+  <> " | time=" <> show audit.chargedAt
+  <> " | agent=" <> show audit.spender
+  <> " | paid=" <> show audit.counterparty
+  <> " | amount=" <> show audit.amount <> " " <> audit.instrumentId.id
+  <> " | memo=" <> audit.memo
+  <> " | permission=exact Party allow-list "
+  <> show audit.allowedCounterparties
+  <> "; cumulative spend "
+  <> show audit.spentAfter <> "/" <> show audit.totalCap
+  <> "; valid until " <> show audit.expiresAt

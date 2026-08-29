@@ -1,0 +1,154 @@
+-- Test-only Token Standard implementation. Never upload or vet this DAR on a
+-- shared network; production depends only on the stable API interfaces.
+module MockToken where
+
+import DA.Traversable (forA)
+import Prelude hiding (forA)
+
+import Splice.Api.Token.HoldingV1 qualified as Holding
+import Splice.Api.Token.MetadataV1 qualified as Metadata
+import Splice.Api.Token.TransferInstructionV1 qualified as TI
+
+
+template MockHolding
+  with
+    admin : Party
+    owner : Party
+    readers : [Party]
+    instrumentId : Holding.InstrumentId
+    amount : Decimal
+    lock : Optional Holding.Lock
+  where
+    ensure amount > 0.0 && instrumentId.admin == admin
+    signatory admin
+    observer owner :: readers
+
+    choice Consume : ()
+      controller owner
+      do pure ()
+
+    interface instance Holding.Holding for MockHolding where
+      view = Holding.HoldingView with
+        owner = owner
+        instrumentId = instrumentId
+        amount = amount
+        lock = lock
+        meta = Metadata.emptyMetadata
+
+
+data MockMode = MockComplete | MockPending | MockFail
+  deriving (Eq, Show)
+
+
+failedResult : TI.TransferInstructionResult
+failedResult = TI.TransferInstructionResult with
+  output = TI.TransferInstructionResult_Failed
+  senderChangeCids = []
+  meta = Metadata.emptyMetadata
+
+
+-- Only supplies a typed pending instruction CID for rollback tests. The
+-- production package never depends on or uploads this implementation.
+template MockTransferInstruction
+  with
+    admin : Party
+    transfer : TI.Transfer
+    readers : [Party]
+  where
+    signatory admin
+    observer transfer.sender, transfer.receiver, readers
+
+    interface instance TI.TransferInstruction for MockTransferInstruction where
+      view = TI.TransferInstructionView with
+        originalInstructionCid = None
+        transfer = transfer
+        status = TI.TransferPendingReceiverAcceptance
+        meta = Metadata.emptyMetadata
+
+      transferInstruction_acceptImpl _self _arg = pure failedResult
+      transferInstruction_rejectImpl _self _arg = pure failedResult
+      transferInstruction_updateImpl _self _arg = pure failedResult
+      transferInstruction_withdrawImpl _self _arg = pure failedResult
+
+
+template MockTransferFactory
+  with
+    admin : Party
+    readers : [Party]
+    mode : MockMode
+  where
+    signatory admin
+    observer readers
+
+    interface instance TI.TransferFactory for MockTransferFactory where
+      view = TI.TransferFactoryView with
+        admin = admin
+        meta = Metadata.emptyMetadata
+
+      transferFactory_publicFetchImpl _self arg = do
+        assertMsg "factory admin mismatch" (arg.expectedAdmin == admin)
+        pure TI.TransferFactoryView with
+          admin = admin
+          meta = Metadata.emptyMetadata
+
+      transferFactory_transferImpl _self arg = do
+        assertMsg "factory admin mismatch" (arg.expectedAdmin == admin)
+        let transfer = arg.transfer
+        assertMsg "instrument admin mismatch"
+          (transfer.instrumentId.admin == admin)
+        assertMsg "amount must be positive" (transfer.amount > 0.0)
+
+        case mode of
+          MockFail -> pure failedResult
+
+          MockPending -> do
+            instructionCid <- create MockTransferInstruction with
+              admin = admin
+              transfer = transfer
+              readers = readers
+            pure TI.TransferInstructionResult with
+              output = TI.TransferInstructionResult_Pending with
+                transferInstructionCid = toInterfaceContractId instructionCid
+              senderChangeCids = []
+              meta = Metadata.emptyMetadata
+
+          MockComplete -> do
+            inputs <- forA transfer.inputHoldingCids $ \interfaceCid -> do
+              let concreteCid : ContractId MockHolding =
+                    fromInterfaceContractId interfaceCid
+              input <- fetch concreteCid
+              assertMsg "input owner mismatch" (input.owner == transfer.sender)
+              assertMsg "input instrument mismatch"
+                (input.instrumentId == transfer.instrumentId)
+              exercise concreteCid Consume
+              pure input.amount
+
+            let total = sum inputs
+            assertMsg "insufficient mock funds" (total >= transfer.amount)
+
+            receiverCid <- create MockHolding with
+              admin = admin
+              owner = transfer.receiver
+              readers = []
+              instrumentId = transfer.instrumentId
+              amount = transfer.amount
+              lock = None
+
+            senderChangeCids <-
+              if total == transfer.amount
+              then pure []
+              else do
+                changeCid <- create MockHolding with
+                  admin = admin
+                  owner = transfer.sender
+                  readers = readers
+                  instrumentId = transfer.instrumentId
+                  amount = total - transfer.amount
+                  lock = None
+                pure [toInterfaceContractId changeCid]
+
+            pure TI.TransferInstructionResult with
+              output = TI.TransferInstructionResult_Completed with
+                receiverHoldingCids = [toInterfaceContractId receiverCid]
+              senderChangeCids = senderChangeCids
+              meta = Metadata.emptyMetadata

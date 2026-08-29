@@ -1,0 +1,16 @@
+sdk-version: 3.4.10
+name: cantor8-d1-token-wallet
+source: daml
+version: 0.1.2
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  # Stable Canton Token Standard V1 APIs from the pinned Splice LocalNet 0.6.8
+  # bundle. The concrete Amulet implementation is deliberately not a compile
+  # dependency. See THIRD_PARTY.md for package IDs and provenance.
+  - ../dars/splice-api-token-metadata-v1-1.0.0.dar
+  - ../dars/splice-api-token-holding-v1-1.0.0.dar
+  - ../dars/splice-api-token-transfer-instruction-v1-1.0.0.dar
+build-options:
+  - --target=2.1
